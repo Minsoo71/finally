@@ -454,3 +454,85 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - Portfolio visualization: heatmap renders with correct colors, P&L chart has data points
 - AI chat (mocked): send a message, receive a response, trade execution appears inline
 - SSE resilience: disconnect and verify reconnection
+
+---
+
+## 13. Review Notes — Questions, Clarifications & Simplifications
+
+Added by a documentation review pass. Items are grouped by how much they block implementation. Nothing above this section was altered; resolve these by editing the relevant section and deleting the item here.
+
+### A. Blocking — an agent cannot implement these without a decision
+
+**A1. "Daily change %" has no data source.** §2 and §10 require a daily change % in the watchlist, but the `PriceUpdate` model (per `MARKET_DATA_SUMMARY.md`) carries only `previous_price` — the *previous tick*, ~500ms ago, not the previous close. Nothing in the schema, the simulator, or the SSE contract provides a session open or prior close. Options: (a) define "daily change" as **change since page load / process start** and rename the column to "Change %" — simplest, no backend work; (b) have the simulator record a session-open price per ticker and add it to `PriceUpdate`; (c) fetch prior close from Massive (unavailable in simulator mode, so the two sources diverge). **Recommend (a)** — it is honest about what a simulator can know.
+
+**A2. Prices are needed for tickers *not* on the watchlist.** Removing a ticker from the watchlist calls `source.remove_ticker()`, which stops pricing it. If the user holds a position in that ticker, portfolio valuation, the positions table, the heatmap and P&L all break. Rule needed: **the priced ticker set is the union of watchlist ∪ open positions**, and removal from the watchlist must not drop a held ticker from the price source. Section 6 says "the union of all watched tickers" — clarify that "watched" means this union.
+
+**A3. Adding an arbitrary ticker to the watchlist is unspecified.** §8 allows `POST /api/watchlist {ticker}` and §9 lets the LLM add e.g. `PYPL`, but `seed_prices.py` only knows the 10 defaults. What happens for an unknown symbol? Needs: a seed-price rule for unknown tickers in simulator mode (e.g. deterministic pseudo-random price in $20–$500 derived from a hash of the symbol, with default drift/vol), a validation rule (format only? a fixed allowlist?), and the error response for a rejected symbol. Also: does Massive mode validate against the real API before accepting?
+
+**A4. Chat history is persisted but never readable.** `chat_messages` is in the schema and §9 step 7 stores messages, but §8 exposes no `GET /api/chat`. On page reload the chat panel would be empty despite the data existing. Either add `GET /api/chat/history?limit=N` or drop the persistence and state that chat is session-only. **Recommend adding the endpoint** — the table already exists and reload-survives-chat is a better demo.
+
+**A5. Trade validation rules are undefined.** §8 gives the request shape but no semantics. Please specify: minimum quantity and whether fractional buys are allowed from the UI (the schema supports `REAL`); rejection of zero/negative/non-numeric quantity; behaviour when no cached price exists for the ticker; float rounding policy for cash and `avg_cost` (round to cents on write? keep full precision and round only at display?); whether a sell that zeroes a position **deletes** the row or leaves `quantity = 0`; and the exact `avg_cost` formula on a partial sell (convention: average cost is unchanged by sells, realized P&L is not tracked — confirm that realized P&L is genuinely out of scope, since §2 promises only *unrealized* P&L).
+
+**A6. Error contract is unspecified.** No status codes or body shape are given for any failure (insufficient cash, unknown ticker, duplicate watchlist entry, LLM failure). Suggest one documented shape — `{"error": {"code": "INSUFFICIENT_CASH", "message": "..."}}` with 400 for validation, 404 for unknown resource, 502 for upstream LLM/market failures — so frontend and E2E tests can assert against it.
+
+### B. Clarifications — implementable, but two agents could reasonably disagree
+
+**B1. Skill name mismatch.** §9 says "use cerebras-inference skill" twice. The installed skill is named **`cerebras`**. An agent following this literally will fail to invoke it. Fix the name in §9.
+
+**B2. Missing-key behaviour.** §5 marks `OPENROUTER_API_KEY` as *required*, but never says what happens if it is absent and `LLM_MOCK=false`. Fail fast at startup, or degrade to mock mode with a banner? (Degrading silently would make a broken demo look like a working one — recommend failing the `/api/chat` request with a clear error while the rest of the app runs normally.)
+
+**B3. What the mock actually returns.** §9 says "deterministic mock responses" without defining them. E2E scenario "trade execution appears inline" can only be written if the mock's behaviour is pinned down — e.g. *if the message contains "buy" and a ticker, return a trade for 1 share; otherwise return a canned analysis message*. Specify it here so the test author and backend author agree.
+
+**B4. Conversation history window.** §9 step 2 says "recent conversation history" — how many messages, or how many tokens? Suggest a fixed last-N (e.g. 20 messages) for predictability.
+
+**B5. Does the LLM see prices, or a snapshot?** §9 step 1 says "watchlist with live prices". Confirm this is a point-in-time snapshot read from `PriceCache` at request time, and that trades auto-executed in step 6 fill at the price *at execution time*, not the price shown in the prompt — these can differ by several ticks and the difference will show up in the chat transcript.
+
+**B6. How does the header's "portfolio total value (updating live)" update?** Options: frontend recomputes from SSE prices × locally-held positions (no extra requests, recommended), or polls `/api/portfolio`. State which — it determines whether `/api/portfolio` needs to be cheap enough to poll.
+
+**B7. Portfolio snapshot growth.** A row every 30s is ~2,880/day, unbounded, on a persistent volume. `GET /api/portfolio/history` takes no parameters. Add a `?since=`/`?limit=` parameter and either a retention window or downsampling for the chart, or state explicitly that unbounded growth is acceptable for a demo.
+
+**B8. SQLite concurrency.** A background snapshot task writes every 30s while request handlers read and write. Specify `PRAGMA journal_mode=WAL`, a busy timeout, and the connection strategy (connection-per-request vs. a single shared connection with a lock) — otherwise `database is locked` will appear intermittently under the SSE + snapshot load.
+
+**B9. Timestamps.** All schema fields say "ISO timestamp" — confirm UTC with an explicit offset/`Z` suffix, so the frontend charts don't drift by the local timezone.
+
+**B10. Static export routing.** Next.js `output: 'export'` emits `index.html` (and directory-style paths if `trailingSlash: true`). Clarify the FastAPI mount: `/api/*` first, everything else falling back to the exported `index.html`. Worth one line in §11 — it is a common first-run failure.
+
+**B11. Charting library note is inaccurate.** §10 says "Canvas-based charting library preferred (Lightweight Charts or Recharts)". Recharts is **SVG**-based, not canvas. Pick one library and say so — mixing two chart libraries for sparkline / main chart / heatmap / P&L would be the single biggest source of frontend bloat. (Recharts covers line + treemap in one package; Lightweight Charts is faster but has no treemap.)
+
+**B12. Main chart on a fresh load.** Like sparklines, the detail chart is fed from SSE since page load, so a newly-loaded page shows an empty chart until data accumulates. Confirm this is intended and describe the empty state — or add a bounded server-side ring buffer of recent ticks (~5 min) plus a `GET /api/history/{ticker}` so charts are populated immediately. This is a visible first-impression issue for a demo.
+
+**B13. Health check contents.** Define what `/api/health` returns beyond 200 — e.g. market-data source name, whether the cache has been populated, DB reachability. Useful for the Docker healthcheck and for debugging.
+
+### C. Internal inconsistencies
+
+**C1. Volume mount is described two different ways.** §11 shows `docker run -v finally-data:/app/db` (a **named Docker volume**), while the following sentence and §4 say "the `db/` directory in the project root maps to `/app/db`" (a **bind mount**, `-v ./db:/app/db`). These are mutually exclusive: with the named volume, the project's `db/` directory stays empty and `.gitkeep` serves no purpose. Pick one. (Named volume is cleaner for students; bind mount makes the DB file inspectable — which is arguably better for a teaching project.)
+
+**C2. `backend/db/` vs top-level `db/`.** Two directories one path segment apart, with completely different roles (schema code vs. runtime data file). This will be misread by both humans and agents. Rename the code one to `backend/app/storage/` or `backend/app/database/`.
+
+**C3. §6 SSE cadence vs. the shipped implementation.** §6 says the server "pushes price updates ... at a regular cadence (~500ms)", while `MARKET_DATA_SUMMARY.md` describes **version-based change detection** on `PriceCache` — i.e. push on change, not on a fixed clock. Update §6 to match what was built, since §6 is the contract the frontend agent will code against.
+
+### D. Simplification opportunities
+
+**D1. Drop prices from `GET /api/watchlist`.** It returns "tickers with latest prices", but the SSE stream delivers prices for every known ticker within ~500ms of connecting. Returning just the ticker list removes a second source of truth for price (and a class of "the table showed a stale price for half a second" bugs).
+
+**D2. Drop `docker-compose.yml`.** §3 explicitly argues against orchestration and §4 already marks it "optional convenience wrapper". The start scripts plus one documented `docker run` line cover it. One fewer file to keep in sync. (`test/docker-compose.test.yml` still earns its place.)
+
+**D3. Simplify two tables' keys.** `watchlist` and `positions` both carry a UUID `id` *plus* a `UNIQUE(user_id, ticker)` constraint. The composite key is the real identity; the UUID is never referenced by anything. Making `(user_id, ticker)` the primary key removes a column, an index, and UUID-generation code from both. (`trades`, `portfolio_snapshots` and `chat_messages` are genuinely append-only and should keep their UUIDs.)
+
+**D4. Fold `users_profile` down to what is used.** Only `cash_balance` is ever read. `created_at` is written and never used. Keep the table (it is the natural home for future fields), drop the unused column.
+
+**D5. One payload for four widgets.** The positions table, heatmap, P&L figures and header all derive from the same data. Specify `GET /api/portfolio` as the single source — positions with `quantity`, `avg_cost`, `current_price`, `market_value`, `unrealized_pnl`, `pnl_pct`, `weight` — computed server-side once, rather than each frontend component recomputing P&L from raw fields. Removes the risk of four components disagreeing about the same number.
+
+**D6. One start script, not four.** `start_mac.sh` / `stop_mac.sh` / `start_windows.ps1` / `stop_windows.ps1` are four files containing two `docker` commands. Since Python is already a project dependency, a single `scripts/run.py` with `start`/`stop` subcommands would work identically on both platforms. (Counter-argument: shell scripts are more legible to students and require no interpreter assumptions — a reasonable reason to keep them. Flagging the trade-off, not asserting the answer.)
+
+**D7. Consider dropping the treemap.** The heatmap and the positions table convey the same information, and treemap layout is the most implementation-heavy visual in §10 for the least information gained on a portfolio of ~5 positions. If the visual drama is wanted, a row of P&L-coloured cards sized by weight gets ~90% of the effect for ~10% of the code. Worth an explicit keep/cut decision rather than defaulting to keep.
+
+**D8. `CLAUDE.md` inlines this entire document.** Every session loads all of PLAN.md into context via `@planning/PLAN.md`, and it will keep growing as sections are completed. Consider replacing the inline include with a short summary plus a pointer ("read `planning/PLAN.md` when working on X"), mirroring how `MARKET_DATA_SUMMARY.md` is already referenced.
+
+### E. Not addressed anywhere
+
+- **Market hours.** Does the simulator run 24/7, or model a closed market? (24/7 is almost certainly right for a demo — but say so, because a user opening the app on a Sunday will notice either way.)
+- **Multiple browser tabs.** Two tabs = two SSE connections against one shared cache. Presumably fine; worth one sentence confirming it is a supported case, since the plan repeatedly reasons from "single user".
+- **Resetting the demo.** There is no way to get back to $10,000 short of deleting the volume. A `POST /api/reset` would be ~15 lines and makes the app far more demo-able and E2E-testable.
+- **Frontend unit test runner.** §12 names React Testing Library but no runner (Vitest vs. Jest) — pick one, as it affects `frontend/` config.
+- **Accessibility / motion.** Price flashing is the core visual effect. A `prefers-reduced-motion` fallback is a few lines of CSS and worth naming in §2.
